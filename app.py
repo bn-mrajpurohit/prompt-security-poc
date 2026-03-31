@@ -1,11 +1,9 @@
 """
-Azure Prompt Shield — Shielded Chat Interface (PoC)
-====================================================
-requirements.txt:
-    streamlit>=1.35.0
-    requests>=2.31.0
-    openai>=1.30.0
-    python-dotenv>=1.0.0
+Shielded Chat Interface — multi-provider safety PoC
+=====================================================
+Supported safety providers:
+  • Azure Content Safety  (Prompt Shield + analyzeText)
+  • AWS Bedrock Guardrails
 
 Run:
     streamlit run app.py
@@ -13,25 +11,22 @@ Run:
 
 import os
 
-import requests
 from dotenv import load_dotenv
 
-# Load .env before any os.environ.get() calls so env-var fallbacks work.
 load_dotenv()
 
 import streamlit as st
 from openai import OpenAI
 
+from safety_providers import PROVIDER_NAMES, SafetyResult, build_provider
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# LITELLM_API_BASE can be overridden via .env; hard-coded value is the default.
 LITELLM_BASE_URL = os.environ.get("LITELLM_API_BASE", "https://api.iq.cudasvc.com")
-# Model name exposed by the IQ API — adjust to whatever is deployed.
 LITELLM_MODEL = "gpt-4o-mini"
 
-# Placeholder shown when no real LLM key is available yet.
 _NO_KEY_RESPONSE = (
     "⚠️  *LLM key not configured.* Your prompt was safe and would have been "
     "forwarded to the model. Set `LITELLM_API_KEY` (or enter it in the sidebar) "
@@ -40,188 +35,28 @@ _NO_KEY_RESPONSE = (
 
 
 # ---------------------------------------------------------------------------
-# Azure Prompt Shield — core analysis function
-# ---------------------------------------------------------------------------
-
-def analyze_prompt(user_text: str, endpoint: str, key: str) -> dict | None:
-    """
-    Send *user_text* to the Azure Content Safety Prompt Shield REST API.
-
-    The azure-ai-contentsafety SDK v1.0.0 does not yet include ShieldPrompt
-    models, so we call the preview REST endpoint directly with `requests`.
-
-    API reference:
-      POST {endpoint}/contentsafety/text:shieldPrompt?api-version=2024-02-15-preview
-
-    Returns a dict with keys:
-        - "attackDetected"     (bool) — True if userPromptAnalysis flagged an attack
-        - "userPromptAnalysis" (dict) — raw per-category block from the API
-        - "raw"                (dict) — full API response body
-
-    Returns None on configuration/network errors (st.error already called).
-    """
-    if not endpoint or not key:
-        st.error(
-            "⚠️ Azure Content Safety credentials are missing. "
-            "Contact your administrator."
-        )
-        return None
-
-    # Build the REST URL — strip trailing slash to avoid double-slash.
-    url = (
-        f"{endpoint.rstrip('/')}"
-        "/contentsafety/text:shieldPrompt"
-        "?api-version=2024-02-15-preview"
-    )
-    headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Content-Type": "application/json",
-    }
-    # 'documents' can hold RAG/grounding docs for doc-injection detection.
-    # Left empty here since we only shield the live user prompt.
-    payload = {"userPrompt": user_text, "documents": []}
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-
-        # Surface HTTP-level errors (401 Unauthorized, 404, etc.) clearly.
-        if not resp.ok:
-            st.error(
-                f"🔴 Azure API error {resp.status_code}: {resp.text}\n\n"
-                "Check that your endpoint URL and API key are correct."
-            )
-            return None
-
-        raw: dict = resp.json()
-
-        # userPromptAnalysis.attackDetected is the primary signal.
-        upa: dict = raw.get("userPromptAnalysis", {})
-        attack_detected: bool = bool(upa.get("attackDetected", False))
-
-        return {
-            "attackDetected": attack_detected,
-            "userPromptAnalysis": upa,
-            "raw": raw,
-        }
-
-    except requests.exceptions.Timeout:
-        st.error("🔴 Request to Azure Prompt Shield timed out. Check your endpoint URL.")
-        return None
-    except Exception as exc:  # pylint: disable=broad-except
-        st.error(f"🔴 Unexpected error calling Azure Prompt Shield: {exc}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Azure Content Safety — harmful content analysis (hate, violence, etc.)
-# ---------------------------------------------------------------------------
-
-# Severity levels returned by the API: 0=Safe, 2=Low, 4=Medium, 6=High.
-# We block anything at or above this threshold.
-HARM_SEVERITY_THRESHOLD = 2
-
-
-def analyze_text_content(user_text: str, endpoint: str, key: str) -> dict | None:
-    """
-    Call the Azure Content Safety *analyzeText* API to score the prompt across
-    four harm categories: Hate, SelfHarm, Sexual, Violence.
-
-    This is a SEPARATE check from Prompt Shield:
-      - Prompt Shield  → detects prompt-injection / jailbreak ATTACKS
-      - analyzeText    → detects HARMFUL CONTENT (hate speech, violence, etc.)
-
-    Returns a dict with keys:
-        - "harmDetected"        (bool) — True if any category >= threshold
-        - "categoriesAnalysis"  (list) — raw per-category severity scores
-        - "raw"                 (dict) — full API response body
-
-    Returns None on error (st.error already called).
-    """
-    if not endpoint or not key:
-        return None  # credentials error already surfaced by analyze_prompt
-
-    url = (
-        f"{endpoint.rstrip('/')}"
-        "/contentsafety/text:analyze"
-        "?api-version=2023-10-01"
-    )
-    headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": user_text,
-        "categories": ["Hate", "SelfHarm", "Sexual", "Violence"],
-        "outputType": "FourSeverityLevels",  # 0 / 2 / 4 / 6
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-
-        if not resp.ok:
-            st.warning(
-                f"⚠️ Content analysis API error {resp.status_code}: {resp.text}"
-            )
-            return None
-
-        raw: dict = resp.json()
-        categories: list = raw.get("categoriesAnalysis", [])
-
-        # Flag as harmful if any category score meets or exceeds threshold.
-        harm_detected = any(
-            c.get("severity", 0) >= HARM_SEVERITY_THRESHOLD for c in categories
-        )
-
-        return {
-            "harmDetected": harm_detected,
-            "categoriesAnalysis": categories,
-            "raw": raw,
-        }
-
-    except requests.exceptions.Timeout:
-        st.warning("⚠️ Content analysis API timed out.")
-        return None
-    except Exception as exc:  # pylint: disable=broad-except
-        st.warning(f"⚠️ Unexpected error in content analysis: {exc}")
-        return None
-
-
-# ---------------------------------------------------------------------------
 # LLM call via IQ API
 # ---------------------------------------------------------------------------
 
 def call_llm(messages: list[dict], llm_api_key: str) -> str:
-    """
-    Forward the (already-shielded) conversation to the IQ API.
-
-    *messages* follows the OpenAI chat format:
-        [{"role": "user"|"assistant"|"system", "content": "..."}]
-
-    Returns the assistant's reply as a plain string.
-    """
     if not llm_api_key:
         return _NO_KEY_RESPONSE
-
     try:
-        client = OpenAI(
-            api_key=llm_api_key,
-            base_url=LITELLM_BASE_URL,
-        )
+        client = OpenAI(api_key=llm_api_key, base_url=LITELLM_BASE_URL)
         completion = client.chat.completions.create(
-            model=LITELLM_MODEL,
-            messages=messages,
+            model=LITELLM_MODEL, messages=messages
         )
         return completion.choices[0].message.content or "(empty response)"
-    except Exception as exc:  # pylint: disable=broad-except
+    except Exception as exc:
         return f"⚠️ LLM call failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Streamlit page config
+# Page config
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Shielded Chat — Azure Prompt Shield PoC",
+    page_title="Shielded Chat — Multi-Provider Safety PoC",
     page_icon="🛡️",
     layout="wide",
 )
@@ -235,15 +70,32 @@ with st.sidebar:
     st.title("⚙️ Configuration")
     st.markdown("---")
 
-    # Azure Content Safety credentials are read exclusively from environment
-    # variables / .env — they are NOT exposed to end users.
-    azure_endpoint = os.environ.get("AZURE_CONTENT_SAFETY_ENDPOINT", "")
-    azure_key      = os.environ.get("AZURE_CONTENT_SAFETY_KEY", "")
+    # ---- Safety provider selection ----------------------------------------
+    st.subheader("🛡️ Safety Provider")
+    selected_provider_name: str = st.selectbox(
+        "Provider",
+        PROVIDER_NAMES,
+        help="Choose which safety API analyses prompts before they reach the LLM.",
+    )
 
+    # ---- Provider-specific credentials (loaded from env, not shown in UI) --
+    if selected_provider_name == "Azure Content Safety":
+        provider_kwargs = {
+            "azure_endpoint": os.environ.get("AZURE_CONTENT_SAFETY_ENDPOINT", ""),
+            "azure_key": os.environ.get("AZURE_CONTENT_SAFETY_KEY", ""),
+        }
+
+    elif selected_provider_name == "AWS Bedrock Guardrails":
+        provider_kwargs = {
+            "guardrail_id": os.environ.get("AWS_GUARDRAIL_ID", ""),
+            "guardrail_version": os.environ.get("AWS_GUARDRAIL_VERSION", "DRAFT"),
+            "aws_region": os.environ.get("AWS_REGION", "us-east-1"),
+        }
+
+    st.markdown("---")
+
+    # ---- LLM settings -----------------------------------------------------
     st.subheader("🤖 Model via IQ")
-
-    # IQ API key is intentionally NOT pre-populated — each end user must
-    # enter their own personal key. Never read LITELLM_API_KEY from env here.
     llm_api_key = st.text_input(
         "IQ API Key",
         value="",
@@ -260,14 +112,12 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🗑️ Clear chat history"):
         st.session_state.messages = []
-        st.session_state.last_shield_data = None
+        st.session_state.last_safety_result = None
         st.rerun()
 
     st.markdown("---")
     st.caption(
-        "Azure Prompt Shield PoC · built with "
-        "[azure-ai-contentsafety](https://pypi.org/project/azure-ai-contentsafety/) "
-        "& Streamlit"
+        "Shielded Chat PoC · supports Azure Content Safety & AWS Bedrock Guardrails"
     )
 
 
@@ -276,16 +126,13 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 if "messages" not in st.session_state:
-    # Each entry: {"role": "user"|"assistant", "content": str, "blocked": bool}
     st.session_state.messages = []
 
-if "last_shield_data" not in st.session_state:
-    # Holds the raw Azure Prompt Shield response for the most recent prompt.
-    st.session_state.last_shield_data = None
+if "last_safety_result" not in st.session_state:
+    st.session_state.last_safety_result = None
 
-if "last_content_data" not in st.session_state:
-    # Holds the raw analyzeText (harm categories) response for the most recent prompt.
-    st.session_state.last_content_data = None
+if "last_provider_name" not in st.session_state:
+    st.session_state.last_provider_name = None
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +141,8 @@ if "last_content_data" not in st.session_state:
 
 st.title("🛡️ Shielded Chat Interface")
 st.markdown(
-    "Every message passes through **two Azure Content Safety checks** before "
-    "reaching the LLM:\n"
-    "1. **Prompt Shield** — blocks prompt-injection & jailbreak *attacks*\n"
-    "2. **Content Analysis** — blocks harmful content (hate, violence, self-harm, sexual)"
+    f"Every message is analysed by **{selected_provider_name}** before reaching the LLM. "
+    "Blocked prompts are never forwarded."
 )
 st.markdown("---")
 
@@ -307,16 +152,11 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 
 for msg in st.session_state.messages:
-    role    = msg["role"]
-    content = msg["content"]
-    blocked = msg.get("blocked", False)
-
-    with st.chat_message(role):
-        if blocked:
-            # Render blocked user messages in a red warning box.
-            st.error(f"🚫 *[BLOCKED]* {content}")
+    with st.chat_message(msg["role"]):
+        if msg.get("blocked"):
+            st.error(f"🚫 *[BLOCKED]* {msg['content']}")
         else:
-            st.markdown(content)
+            st.markdown(msg["content"])
 
 
 # ---------------------------------------------------------------------------
@@ -326,74 +166,46 @@ for msg in st.session_state.messages:
 user_input: str | None = st.chat_input("Type your message…")
 
 if user_input:
-    # ---- 1. Show the user's message immediately in the UI -----------------
+    # 1. Show the user's message in the UI immediately.
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # ---- 2a. Check 1 — Azure Prompt Shield (injection / jailbreak) --------
-    shield_result: dict | None = None
-    with st.spinner("🔍 Check 1/2 — Scanning for prompt injection & jailbreaks…"):
-        shield_result = analyze_prompt(user_input, azure_endpoint, azure_key)
+    # 2. Build the selected provider and analyse the prompt.
+    provider = build_provider(selected_provider_name, **provider_kwargs)
 
-    # ---- 2b. Check 2 — Azure Content Safety analyzeText (harmful content) -
-    content_result: dict | None = None
-    with st.spinner("🔍 Check 2/2 — Scanning for harmful content…"):
-        content_result = analyze_text_content(user_input, azure_endpoint, azure_key)
+    with st.spinner(f"🔍 Analysing with {selected_provider_name}…"):
+        result: SafetyResult = provider.analyze(user_input)
 
-    # Persist both results for the "Under the Hood" expander.
-    st.session_state.last_shield_data  = shield_result
-    st.session_state.last_content_data = content_result
+    st.session_state.last_safety_result = result
+    st.session_state.last_provider_name = selected_provider_name
 
-    # ---- 3. Determine block reason (either check can independently block) --
-    attack_blocked = shield_result is not None and shield_result["attackDetected"]
-    harm_blocked   = content_result is not None and content_result["harmDetected"]
+    # 3a. Provider configuration / network error.
+    if result.error:
+        st.error(f"🔴 Safety provider error: {result.error}")
 
-    # ---- 4a. BLOCKED by Prompt Shield (injection / jailbreak) -------------
-    if attack_blocked:
+    # 3b. Prompt blocked.
+    elif result.blocked:
         with st.chat_message("assistant"):
             st.error(
-                "🚨 **Prompt Injection / Jailbreak Detected — Access Blocked.**\n\n"
-                "Azure Prompt Shield identified this as an attempt to manipulate "
-                "or bypass the AI system. The prompt has **not** been forwarded to the LLM."
-            )
-        st.session_state.messages.append(
-            {"role": "user", "content": user_input, "blocked": True}
-        )
-
-    # ---- 4b. BLOCKED by Content Safety (harmful content) ------------------
-    elif harm_blocked:
-        # Surface which categories triggered and at what severity.
-        triggered = [
-            f"{c['category']} (severity {c['severity']})"
-            for c in (content_result.get("categoriesAnalysis") or [])
-            if c.get("severity", 0) >= HARM_SEVERITY_THRESHOLD
-        ]
-        triggered_str = ", ".join(triggered) if triggered else "unknown category"
-
-        with st.chat_message("assistant"):
-            st.error(
-                f"🚨 **Harmful Content Detected — Access Blocked.**\n\n"
-                f"Azure Content Safety flagged: **{triggered_str}**.\n\n"
+                f"🚨 **Prompt Blocked.**\n\n{result.reason or 'Blocked by safety provider.'}\n\n"
                 "This prompt has **not** been forwarded to the LLM."
             )
         st.session_state.messages.append(
             {"role": "user", "content": user_input, "blocked": True}
         )
 
-    # ---- 4c. SAFE — both checks passed, forward to LLM --------------------
-    elif shield_result is not None:
-        # Append to history only after passing both checks.
+    # 3c. Safe — forward to LLM.
+    else:
         st.session_state.messages.append(
             {"role": "user", "content": user_input, "blocked": False}
         )
 
-        # Build the full conversation context for the LLM.
         llm_messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant. All user messages have been "
-                    "pre-screened by Azure Content Safety (Prompt Shield + harm analysis)."
+                    f"You are a helpful assistant. All user messages have been "
+                    f"pre-screened by {selected_provider_name}."
                 ),
             }
         ] + [
@@ -412,90 +224,103 @@ if user_input:
             {"role": "assistant", "content": assistant_reply, "blocked": False}
         )
 
-    # shield_result is None → credentials error already shown; do nothing else.
-
 
 # ---------------------------------------------------------------------------
-# PM Demo Feature — "Under the Hood" expander
+# "Under the Hood" expander — safety analysis details
 # ---------------------------------------------------------------------------
 
 st.markdown("---")
-with st.expander("🛠️ Under the Hood: Shield Analysis Data", expanded=False):
-    st.markdown(
-        "Raw responses from **both** Azure safety checks for the most recent prompt."
-    )
+with st.expander("🛠️ Under the Hood: Safety Analysis", expanded=False):
+    result: SafetyResult | None = st.session_state.last_safety_result
+    provider_name: str | None = st.session_state.last_provider_name
 
-    shield_data  = st.session_state.last_shield_data
-    content_data = st.session_state.last_content_data
-
-    if shield_data is None and content_data is None:
-        st.info("No prompt has been analyzed yet. Send a message above to see results here.")
+    if result is None:
+        st.info("No prompt has been analysed yet. Send a message above to see results here.")
     else:
-        # ================================================================
-        # CHECK 1 — Prompt Shield (injection / jailbreak)
-        # ================================================================
-        st.subheader("🔒 Check 1: Prompt Shield (Injection / Jailbreak)")
+        st.markdown(f"**Provider:** {provider_name}")
 
-        if shield_data is None:
-            st.warning("Prompt Shield result unavailable.")
+        if result.error:
+            st.error(f"Provider error: {result.error}")
         else:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric(
-                    "Shield Result",
-                    "🚨 ATTACK" if shield_data["attackDetected"] else "✅ SAFE",
-                )
-            with c2:
-                st.metric(
-                    "Attack Detected",
-                    "Yes" if shield_data["attackDetected"] else "No",
-                )
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Result", "🚨 BLOCKED" if result.blocked else "✅ SAFE")
+            with col2:
+                st.metric("Blocked", "Yes" if result.blocked else "No")
 
-            upa = shield_data.get("userPromptAnalysis", {})
-            if isinstance(upa, dict) and upa:
-                cols = st.columns(max(len(upa), 1))
-                for i, (cat, val) in enumerate(upa.items()):
-                    with cols[i % len(cols)]:
-                        display = ("🔴 True" if val else "🟢 False") if isinstance(val, bool) else str(val)
-                        st.metric(label=cat, value=display)
+            if result.reason:
+                st.warning(f"**Reason:** {result.reason}")
 
-            with st.expander("📋 Raw JSON — Prompt Shield"):
-                st.json(shield_data["raw"])
+            # ---- Azure-specific detailed view --------------------------------
+            if provider_name == "Azure Content Safety" and result.details:
+                shield = result.details.get("shield") or {}
+                content = result.details.get("content") or {}
 
-        st.markdown("---")
-
-        # ================================================================
-        # CHECK 2 — Content Analysis (harmful content categories)
-        # ================================================================
-        st.subheader("🔍 Check 2: Content Analysis (Hate / Violence / Self-Harm / Sexual)")
-
-        if content_data is None:
-            st.warning("Content analysis result unavailable.")
-        else:
-            c3, c4 = st.columns(2)
-            with c3:
-                st.metric(
-                    "Content Result",
-                    "🚨 HARMFUL" if content_data["harmDetected"] else "✅ SAFE",
-                )
-            with c4:
-                st.metric(
-                    "Harm Detected",
-                    "Yes" if content_data["harmDetected"] else "No",
-                )
-
-            # Severity per category — 0=safe, 2=low, 4=medium, 6=high
-            categories = content_data.get("categoriesAnalysis", [])
-            if categories:
-                severity_label = {0: "🟢 0 — Safe", 2: "🟡 2 — Low", 4: "🟠 4 — Medium", 6: "🔴 6 — High"}
-                cat_cols = st.columns(len(categories))
-                for i, cat in enumerate(categories):
-                    sev = cat.get("severity", 0)
-                    with cat_cols[i]:
+                st.subheader("🔒 Check 1: Prompt Shield (Injection / Jailbreak)")
+                if not shield:
+                    st.warning("Prompt Shield result unavailable.")
+                else:
+                    c1, c2 = st.columns(2)
+                    with c1:
                         st.metric(
-                            label=cat.get("category", "?"),
-                            value=severity_label.get(sev, f"Severity {sev}"),
+                            "Shield Result",
+                            "🚨 ATTACK" if shield.get("attackDetected") else "✅ SAFE",
                         )
+                    with c2:
+                        st.metric(
+                            "Attack Detected",
+                            "Yes" if shield.get("attackDetected") else "No",
+                        )
+                    upa = shield.get("userPromptAnalysis", {})
+                    if isinstance(upa, dict) and upa:
+                        cols = st.columns(max(len(upa), 1))
+                        for i, (cat, val) in enumerate(upa.items()):
+                            display = (
+                                ("🔴 True" if val else "🟢 False")
+                                if isinstance(val, bool)
+                                else str(val)
+                            )
+                            with cols[i % len(cols)]:
+                                st.metric(label=cat, value=display)
+                    with st.expander("📋 Raw JSON — Prompt Shield"):
+                        st.json(shield.get("raw", {}))
 
-            with st.expander("📋 Raw JSON — Content Analysis"):
-                st.json(content_data["raw"])
+                st.markdown("---")
+                st.subheader("🔍 Check 2: Content Analysis (Hate / Violence / Self-Harm / Sexual)")
+                if not content:
+                    st.warning("Content analysis result unavailable.")
+                else:
+                    c3, c4 = st.columns(2)
+                    with c3:
+                        st.metric(
+                            "Content Result",
+                            "🚨 HARMFUL" if content.get("harmDetected") else "✅ SAFE",
+                        )
+                    with c4:
+                        st.metric(
+                            "Harm Detected",
+                            "Yes" if content.get("harmDetected") else "No",
+                        )
+                    categories = content.get("categoriesAnalysis", [])
+                    if categories:
+                        severity_label = {
+                            0: "🟢 0 — Safe",
+                            2: "🟡 2 — Low",
+                            4: "🟠 4 — Medium",
+                            6: "🔴 6 — High",
+                        }
+                        cat_cols = st.columns(len(categories))
+                        for i, cat in enumerate(categories):
+                            sev = cat.get("severity", 0)
+                            with cat_cols[i]:
+                                st.metric(
+                                    label=cat.get("category", "?"),
+                                    value=severity_label.get(sev, f"Severity {sev}"),
+                                )
+                    with st.expander("📋 Raw JSON — Content Analysis"):
+                        st.json(content.get("raw", {}))
+
+            # ---- AWS or generic fallback ------------------------------------
+            else:
+                with st.expander("📋 Raw Details"):
+                    st.json(result.details)
