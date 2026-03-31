@@ -63,7 +63,7 @@ def analyze_prompt(user_text: str, endpoint: str, key: str) -> dict | None:
     if not endpoint or not key:
         st.error(
             "⚠️ Azure Content Safety credentials are missing. "
-            "Please enter them in the sidebar."
+            "Contact your administrator."
         )
         return None
 
@@ -235,34 +235,21 @@ with st.sidebar:
     st.title("⚙️ Configuration")
     st.markdown("---")
 
-    st.subheader("🔷 Azure Content Safety")
+    # Azure Content Safety credentials are read exclusively from environment
+    # variables / .env — they are NOT exposed to end users.
+    azure_endpoint = os.environ.get("AZURE_CONTENT_SAFETY_ENDPOINT", "")
+    azure_key      = os.environ.get("AZURE_CONTENT_SAFETY_KEY", "")
 
-    # Prefer environment variables; fall back to sidebar text inputs.
-    default_endpoint = os.environ.get("AZURE_CONTENT_SAFETY_ENDPOINT", "")
-    default_key      = os.environ.get("AZURE_CONTENT_SAFETY_KEY", "")
-
-    azure_endpoint = st.text_input(
-        "Endpoint URL",
-        value=default_endpoint,
-        placeholder="https://<your-resource>.cognitiveservices.azure.com",
-        help="Your Azure Content Safety resource endpoint.",
-    )
-    azure_key = st.text_input(
-        "API Key",
-        value=default_key,
-        type="password",
-        help="Azure Content Safety subscription key.",
-    )
-
-    st.markdown("---")
     st.subheader("🤖 Model via IQ")
 
-    default_llm_key = os.environ.get("LITELLM_API_KEY", "")
+    # IQ API key is intentionally NOT pre-populated — each end user must
+    # enter their own personal key. Never read LITELLM_API_KEY from env here.
     llm_api_key = st.text_input(
         "IQ API Key",
-        value=default_llm_key,
+        value="",
         type="password",
-        help="API key for the IQ API at api.iq.cudasvc.com.",
+        placeholder="Enter your IQ API key…",
+        help="Your personal API key for the IQ API at api.iq.cudasvc.com.",
     )
     llm_model = st.text_input(
         "Model name",
